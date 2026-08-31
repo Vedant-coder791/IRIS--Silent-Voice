@@ -165,24 +165,29 @@ The intended structure is:
 ```text
 IRIS/
 ├── src/
-│   ├── preprocessing/
 │   ├── datasets/
-│   └── models/
+│   │   └── berkeley/
+│   ├── models/
+│   │   ├── cnn/
+│   │   └── mlp/
+│   └── preprocessing/
+│       ├── features/
+│       ├── filters/
+│       └── windowing/
 │
 ├── data/
-│   └── processed/
-│
-├── models/
-│
-├── experiments/
+│   ├── processed/
+│   │   └── datasets/
+│   └── statistics/
 │
 ├── results/
+│   ├── figures/
+│   └── reports/
 │
-├── tests/
+├── testings/
 │
-├── docs/
-│
-└── hardware/
+├── README.md
+└── .gitignore
 ```
 
 ---
