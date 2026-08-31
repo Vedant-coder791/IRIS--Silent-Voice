@@ -1,0 +1,20 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Create a Model class that inherits nn.Module
+
+class Module(nn.Module):
+    # Input Layer (MFCC features) --> Hidden layer1 (some neurons) --> H2 (n) --> output
+
+    def __init__(self, In_feature = 4, h1 = 8, h2= 9, out_features= 3):
+        self.fc1 = nn.linear(In_feature, h1)
+        self.fc2 = nn.linear(h1, h2)
+        self.out = nn.linear(h2, out_features)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x= self.out(x)
+
+        return x
