@@ -80,15 +80,7 @@ The project uses iterative prototypes to compare different preprocessing strateg
 
 ## 📊 Datasets
 
-IRIS currently experiments with multiple EMG speech datasets, including:
-
-### Berkeley Silent Speech Dataset
-
-Used for developing and evaluating silent-speech recognition models and investigating subject-independent generalization.
-
-### EMG-UKA Trial Corpus
-
-Used for signal-processing, phoneme-alignment, and speech-EMG experiments.
+The Berkeley dataset is currently used for model development and benchmarking. The eventual Silent Voice neckband will use its own multi-channel sEMG acquisition hardware.
 
 ---
 
