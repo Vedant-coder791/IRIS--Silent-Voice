@@ -67,3 +67,5 @@ silent_speech_alignments/*.tar.gz
 *.tmp
 *.temp
 *.log
+# Original EMG recordings
+Data_original/
