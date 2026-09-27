@@ -8,7 +8,7 @@ The system aims to recognize speech-related muscle activity without requiring th
 
 ---
 
-## 🧠 How IRIS Works
+## 🧠 How Silent Voice Works
 
 ```text
 Silent articulation
@@ -196,6 +196,11 @@ Current work is focused on:
 * Improving subject-independent evaluation
 * Developing the wearable hardware
 * Preparing the model for eventual ESP32 deployment
+
+---
+## 📊 Dataset
+
+To reduce the limitation posed by limited data per word, we are currently in the process of collecting data from a total of 10 participants and intend to collect a total 1000 samples per word.
 
 ---
 
