@@ -1,178 +1,158 @@
+
+
 import asyncio
 import csv
 import struct
-import sys
-import termios
-import tty
-import select
 from pathlib import Path
+from threading import Event, Lock
 
-from bleak import BleakScanner, BleakClient
+from bleak import BleakClient, BleakScanner
+from pynput import keyboard
 
 
-# ==========================================
-# BLE SETTINGS
-# ==========================================
+# ============================================================
+# IRIS SILENT SPEECH RECOGNITION
+# FINAL BLE EMG DATA COLLECTOR
+# ============================================================
 
 DEVICE_NAME = "IRIS-EMG"
+
+SERVICE_UUID = (
+    "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+)
 
 CHARACTERISTIC_UUID = (
     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 )
 
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parent.parent
+)
+
+RAW_ROOT = (
+    PROJECT_ROOT
+    / "Data_original"
+    / "raw"
+)
+
+METADATA_FILE = (
+    RAW_ROOT
+    / "recordings_metadata.csv"
+)
+
+
+# ============================================================
+# ACQUISITION SETTINGS
+# ============================================================
+
 SAMPLE_RATE = 600
 
 SAMPLES_PER_PACKET = 10
 
-# Packet:
-# 4 bytes  = packet sequence
-# 4 bytes  = timestamp of first sample
-# 80 bytes = 10 samples × 4 channels × 2 bytes
 PACKET_SIZE = 88
 
-SAMPLE_INTERVAL_US = 1_000_000 / SAMPLE_RATE
+BYTES_PER_SAMPLE = 8
 
 
-# ==========================================
-# PROJECT PATHS
-# ==========================================
+# ============================================================
+# STATE
+# ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+recording_active = False
 
-RAW_ROOT = PROJECT_ROOT / "Data_original" / "raw"
+recording_started = Event()
 
-METADATA_FILE = RAW_ROOT / "recordings_metadata.csv"
+recording_stopped = Event()
 
-
-# ==========================================
-# EXPERIMENT INFORMATION
-# ==========================================
-
-participant = input(
-    "Participant ID (e.g. P01): "
-).strip()
-
-session = input(
-    "Session number (e.g. 01): "
-).strip()
-
-word = input(
-    "Word (e.g. HELP): "
-).strip().upper()
-
-condition = input(
-    "Condition (SILENT/VOICED/WHISPERED/REST): "
-).strip().upper()
-
-trial = input(
-    "Trial number (e.g. 001): "
-).strip()
+state_lock = Lock()
 
 
-# ==========================================
-# CREATE FOLDER
-# ==========================================
+# ============================================================
+# DATA
+# ============================================================
 
-folder = (
-    RAW_ROOT
-    / participant
-    / f"session_{session}"
-    / condition
-    / word
-)
+samples = []
 
-folder.mkdir(
-    parents=True,
-    exist_ok=True
-)
+received_packets = 0
 
+lost_packets = 0
 
-# ==========================================
-# CREATE FILE
-# ==========================================
+first_packet_sequence = None
 
-filename = (
-    f"{participant}_S{session}_"
-    f"{condition}_{word}_T{trial}.csv"
-)
+last_packet_sequence = None
 
-filepath = folder / filename
+packet_sequence_errors = []
+
+unexpected_packet_sizes = 0
 
 
-# ==========================================
-# PREVENT OVERWRITE
-# ==========================================
+# ============================================================
+# RECORDING INFORMATION
+# ============================================================
 
-if filepath.exists():
+participant = ""
 
-    print("\nERROR: This recording already exists!")
+session = ""
 
-    print(f"File: {filepath}")
+condition = ""
 
-    print(
-        "Please use a different trial number."
-    )
+word = ""
 
-    raise SystemExit
+trial = ""
 
 
-# ==========================================
-# CREATE RAW DIRECTORY
-# ==========================================
+# ============================================================
+# BLE NOTIFICATION HANDLER
+# ============================================================
 
-RAW_ROOT.mkdir(
-    parents=True,
-    exist_ok=True
-)
+def notification_handler(
+    sender,
+    data
+):
 
-
-# ==========================================
-# RECORDING STATE
-# ==========================================
-
-state = {
-    "samples": [],
-    "packet_count": 0,
-    "invalid_packets": 0,
-    "first_timestamp": None,
-    "last_packet_sequence": None,
-    "recording_enabled": False,
-    "recording_finished": False
-}
+    global samples
+    global received_packets
+    global lost_packets
+    global first_packet_sequence
+    global last_packet_sequence
+    global unexpected_packet_sizes
 
 
-# ==========================================
-# BLE CALLBACK
-# ==========================================
+    # ========================================================
+    # ONLY RECORD WHEN ENTER IS HELD
+    # ========================================================
 
-def handle_data(sender, data):
+    with state_lock:
 
-    # --------------------------------------
-    # Ignore data before recording starts
-    # --------------------------------------
+        if not recording_active:
 
-    if not state["recording_enabled"]:
-        return
+            return
 
-    # --------------------------------------
-    # Check packet size
-    # --------------------------------------
+
+    # ========================================================
+    # VERIFY PACKET SIZE
+    # ========================================================
 
     if len(data) != PACKET_SIZE:
 
-        state["invalid_packets"] += 1
+        unexpected_packet_sizes += 1
 
         print(
-            f"\nWARNING: Received "
-            f"{len(data)} bytes "
-            f"instead of {PACKET_SIZE}"
+            f"WARNING: Unexpected packet size: "
+            f"{len(data)} bytes"
         )
 
         return
 
-    # --------------------------------------
-    # Packet header
-    # --------------------------------------
+
+    # ========================================================
+    # READ PACKET HEADER
+    # ========================================================
 
     packet_sequence = struct.unpack_from(
         "<I",
@@ -180,726 +160,720 @@ def handle_data(sender, data):
         0
     )[0]
 
-    first_sample_timestamp = struct.unpack_from(
+
+    packet_timestamp = struct.unpack_from(
         "<I",
         data,
         4
     )[0]
 
-    # --------------------------------------
-    # Check packet sequence
-    # --------------------------------------
 
-    previous_sequence = state[
-        "last_packet_sequence"
-    ]
+    # ========================================================
+    # CHECK PACKET SEQUENCE
+    # ========================================================
 
-    if (
-        previous_sequence is not None
-        and packet_sequence != previous_sequence + 1
+    if first_packet_sequence is None:
+
+        first_packet_sequence = (
+            packet_sequence
+        )
+
+    else:
+
+        expected_sequence = (
+            (last_packet_sequence + 1)
+            & 0xFFFFFFFF
+        )
+
+
+        if packet_sequence != expected_sequence:
+
+            difference = (
+                packet_sequence
+                - expected_sequence
+            ) & 0xFFFFFFFF
+
+
+            if difference > 0:
+
+                lost_packets += difference
+
+                packet_sequence_errors.append(
+                    (
+                        expected_sequence,
+                        packet_sequence,
+                        difference
+                    )
+                )
+
+
+                print(
+                    "WARNING: BLE packet gap detected: "
+                    f"expected {expected_sequence}, "
+                    f"received {packet_sequence}, "
+                    f"missing {difference}"
+                )
+
+
+    last_packet_sequence = packet_sequence
+
+    received_packets += 1
+
+
+    # ========================================================
+    # EXTRACT SAMPLES
+    # ========================================================
+
+    for i in range(
+        SAMPLES_PER_PACKET
     ):
 
-        print(
-            f"\nWARNING: BLE packet gap "
-            f"{previous_sequence} -> "
-            f"{packet_sequence}"
+        offset = (
+            8
+            + i * BYTES_PER_SAMPLE
         )
 
-    state["last_packet_sequence"] = (
-        packet_sequence
-    )
 
-    # --------------------------------------
-    # First packet
-    # --------------------------------------
-
-    if state["first_timestamp"] is None:
-
-        state["first_timestamp"] = (
-            first_sample_timestamp
-        )
-
-        print(
-            "\nRecording started!"
-        )
-
-    # --------------------------------------
-    # Decode 10 samples
-    # --------------------------------------
-
-    for i in range(SAMPLES_PER_PACKET):
-
-        offset = 8 + (i * 8)
-
-        ch1, ch2, ch3, ch4 = struct.unpack_from(
-            "<HHHH",
+        ch1 = struct.unpack_from(
+            "<H",
             data,
             offset
-        )
+        )[0]
 
-        timestamp = int(
-            first_sample_timestamp
-            + (
-                i * SAMPLE_INTERVAL_US
+
+        ch2 = struct.unpack_from(
+            "<H",
+            data,
+            offset + 2
+        )[0]
+
+
+        ch3 = struct.unpack_from(
+            "<H",
+            data,
+            offset + 4
+        )[0]
+
+
+        ch4 = struct.unpack_from(
+            "<H",
+            data,
+            offset + 6
+        )[0]
+
+
+        # ----------------------------------------------------
+        # Reconstruct sample timestamp
+        # ----------------------------------------------------
+        #
+        # The ESP32 timestamp is the timestamp of sample 0.
+        #
+        # The acquisition rate is 600 Hz.
+        #
+
+        timestamp = (
+            packet_timestamp
+            + round(
+                i * 1_000_000 / SAMPLE_RATE
             )
         )
 
-        state["samples"].append([
-            timestamp,
-            ch1,
-            ch2,
-            ch3,
-            ch4
-        ])
 
-    state["packet_count"] += 1
+        samples.append(
+            (
+                timestamp,
+                packet_sequence,
+                ch1,
+                ch2,
+                ch3,
+                ch4
+            )
+        )
 
 
-# ==========================================
-# TERMINAL KEY READING
-# ==========================================
+# ============================================================
+# FIND BLE DEVICE
+# ============================================================
 
-def key_pressed():
+async def find_device():
 
-    """
-    Check whether a key is waiting in stdin.
+    print()
 
-    This is used for macOS terminal control.
-    """
-
-    readable, _, _ = select.select(
-        [sys.stdin],
-        [],
-        [],
-        0
+    print(
+        "Scanning for IRIS-EMG..."
     )
 
-    return bool(readable)
+
+    devices = await BleakScanner.discover(
+        timeout=5
+    )
 
 
-def read_key():
+    for device in devices:
 
-    """
-    Read one terminal character without waiting.
-    """
+        if device.name == DEVICE_NAME:
 
-    if key_pressed():
+            print(
+                f"Found {DEVICE_NAME}"
+            )
 
-        return sys.stdin.read(1)
+            return device
+
+
+    print()
+
+    print(
+        "ERROR: IRIS-EMG was not found."
+    )
+
+    print(
+        "Check that the ESP32 is powered on "
+        "and advertising."
+    )
 
     return None
 
 
-# ==========================================
-# HOLD-ENTER RECORDING
-# ==========================================
+# ============================================================
+# KEYBOARD PRESS
+# ============================================================
 
-async def wait_for_enter_press():
+def on_press(key):
 
-    """
-    Wait until ENTER is pressed.
+    global recording_active
 
-    Returns when ENTER is detected.
-    """
-
-    print(
-        "\n================================"
-    )
-
-    print(
-        "HOLD ENTER TO RECORD"
-    )
-
-    print(
-        "================================"
-    )
-
-    print(
-        "\nPress and HOLD ENTER..."
-    )
-
-    # Save current terminal settings
-    old_settings = termios.tcgetattr(
-        sys.stdin
-    )
 
     try:
 
-        tty.setcbreak(
-            sys.stdin.fileno()
+        if key == keyboard.Key.enter:
+
+            with state_lock:
+
+                if not recording_active:
+
+                    recording_active = True
+
+                    samples.clear()
+
+
+                    print()
+
+                    print(
+                        "================================"
+                    )
+
+                    print(
+                        "RECORDING STARTED"
+                    )
+
+                    print(
+                        "================================"
+                    )
+
+
+                    recording_started.set()
+
+
+    except Exception as error:
+
+        print(
+            f"Keyboard error: {error}"
         )
 
-        while True:
 
-            key = read_key()
+# ============================================================
+# KEYBOARD RELEASE
+# ============================================================
 
-            if key == "\n" or key == "\r":
+def on_release(key):
 
-                return
+    global recording_active
 
-            await asyncio.sleep(
-                0.01
-            )
-
-    finally:
-
-        termios.tcsetattr(
-            sys.stdin,
-            termios.TCSADRAIN,
-            old_settings
-        )
-
-
-# ==========================================
-# WAIT FOR ENTER RELEASE
-# ==========================================
-
-async def wait_for_enter_release():
-
-    """
-    Wait for ENTER to be released.
-
-    NOTE:
-    Terminal input does not expose a true
-    physical key-release event like a GUI.
-
-    We therefore wait until the terminal
-    stops reporting the Enter key.
-
-    """
-
-    # Give the terminal time to process
-    # the original Enter press.
-
-    await asyncio.sleep(
-        0.15
-    )
-
-    old_settings = termios.tcgetattr(
-        sys.stdin
-    )
 
     try:
 
-        tty.setcbreak(
-            sys.stdin.fileno()
-        )
+        if key == keyboard.Key.enter:
 
-        # Drain remaining ENTER characters
+            with state_lock:
 
-        while key_pressed():
+                if recording_active:
 
-            key = sys.stdin.read(1)
+                    recording_active = False
 
-            if key not in ("\n", "\r"):
 
-                break
+                    print()
 
-            await asyncio.sleep(
-                0.01
-            )
+                    print(
+                        "================================"
+                    )
 
-        # The terminal has now processed
-        # the Enter press.
+                    print(
+                        "RECORDING STOPPED"
+                    )
 
-        # Wait for the next Enter event,
-        # which acts as the release/stop
-        # control in terminal mode.
+                    print(
+                        "================================"
+                    )
 
-        while True:
 
-            key = read_key()
+                    recording_stopped.set()
 
-            if key == "\n" or key == "\r":
 
-                return
+                    return False
 
-            await asyncio.sleep(
-                0.01
-            )
 
-    finally:
+    except Exception as error:
 
-        termios.tcsetattr(
-            sys.stdin,
-            termios.TCSADRAIN,
-            old_settings
+        print(
+            f"Keyboard error: {error}"
         )
 
 
-# ==========================================
-# SIMPLE HOLD-TO-RECORD MODE
-# ==========================================
+# ============================================================
+# CREATE OUTPUT PATH
+# ============================================================
 
-async def hold_to_record():
+def create_output_path():
 
-    """
-    Terminal-safe recording control.
-
-    Press ENTER to start.
-    Press ENTER again to stop.
-
-    Because terminals do not provide true
-    key-release events, this behaves as:
-
-        ENTER → START
-        ENTER → STOP
-    """
-
-    print(
-        "\n================================"
+    folder = (
+        RAW_ROOT
+        / participant
+        / f"session_{int(session):02d}"
+        / condition
+        / word
     )
 
-    print(
-        "PRESS ENTER TO START"
+
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    print(
-        "PRESS ENTER AGAIN TO STOP"
+
+    filename = (
+        f"{participant}"
+        f"_S{int(session):02d}"
+        f"_{condition}"
+        f"_{word}"
+        f"_T{int(trial):03d}.csv"
     )
 
-    print(
-        "================================"
-    )
 
-    input(
-        "\nPress ENTER to start..."
-    )
+    return folder / filename
 
-    return
 
-
-# ==========================================
-# BLE ACQUISITION
-# ==========================================
-
-async def record_ble():
-
-    print("\n================================")
-    print("IRIS BLE ACQUISITION")
-    print("================================")
-
-    print("\nScanning for IRIS-EMG...")
-
-    device = await BleakScanner.find_device_by_name(
-        DEVICE_NAME,
-        timeout=10
-    )
-
-    if device is None:
-
-        print(
-            "\nERROR: IRIS-EMG not found."
-        )
-
-        print(
-            "Make sure the ESP32 is powered "
-            "and advertising."
-        )
-
-        return False
-
-    print("\nFound IRIS-EMG.")
-
-    print(
-        f"Address: {device.address}"
-    )
-
-    print("\nConnecting...")
-
-    async with BleakClient(device) as client:
-
-        print("Connected!")
-
-        print(
-            "\nPreparing BLE acquisition..."
-        )
-
-        await client.start_notify(
-            CHARACTERISTIC_UUID,
-            handle_data
-        )
-
-        print(
-            "BLE notifications enabled."
-        )
-
-        print(
-            f"\nRecording: {word}"
-        )
-
-        print(
-            f"Condition: {condition}"
-        )
-
-        print(
-            "Duration: HOLD ENTER"
-        )
-
-        print(
-            f"Saving to: {filepath}"
-        )
-
-        # ----------------------------------
-        # Reset state
-        # ----------------------------------
-
-        state["samples"].clear()
-
-        state["packet_count"] = 0
-
-        state["invalid_packets"] = 0
-
-        state["first_timestamp"] = None
-
-        state["last_packet_sequence"] = None
-
-        state["recording_finished"] = False
-
-        # ----------------------------------
-        # START
-        # ----------------------------------
-
-        await hold_to_record()
-
-        state["recording_enabled"] = True
-
-        print(
-            "\nWaiting for BLE data..."
-        )
-
-        # ----------------------------------
-        # Wait for first sample
-        # ----------------------------------
-
-        while state["first_timestamp"] is None:
-
-            await asyncio.sleep(
-                0.01
-            )
-
-        # ----------------------------------
-        # RECORD UNTIL USER STOPS
-        # ----------------------------------
-
-        print(
-            "\nRecording..."
-        )
-
-        print(
-            "Press ENTER when finished."
-        )
-
-        # Run the stop input in a thread
-        # so BLE notifications continue.
-
-        stop_task = asyncio.create_task(
-            asyncio.to_thread(
-                input,
-                ""
-            )
-        )
-
-        while not stop_task.done():
-
-            await asyncio.sleep(
-                0.01
-            )
-
-        # ----------------------------------
-        # STOP
-        # ----------------------------------
-
-        state["recording_enabled"] = False
-
-        state["recording_finished"] = True
-
-        print(
-            "\nENTER RELEASED / STOPPING..."
-        )
-
-        await client.stop_notify(
-            CHARACTERISTIC_UUID
-        )
-
-    # ======================================
-    # CHECK DATA
-    # ======================================
-
-    if len(state["samples"]) == 0:
-
-        print(
-            "\nERROR: No samples were recorded."
-        )
-
-        return False
-
-    # ======================================
-    # SAVE
-    # ======================================
-
-    print(
-        "\nSaving recording..."
-    )
-
-    with open(
-        filepath,
-        "w",
-        newline=""
-    ) as file:
-
-        writer = csv.writer(file)
-
-        writer.writerow([
-            "timestamp_us",
-            "CH1",
-            "CH2",
-            "CH3",
-            "CH4"
-        ])
-
-        writer.writerows(
-            state["samples"]
-        )
-
-    # ======================================
-    # VERIFY
-    # ======================================
-
-    if not filepath.exists():
-
-        print(
-            "\nERROR: CSV file was not created."
-        )
-
-        return False
-
-    print(
-        "\nRecording saved successfully:"
-    )
-
-    print(
-        filepath
-    )
-
-    return True
-
-
-# ==========================================
+# ============================================================
 # QUALITY CHECK
-# ==========================================
+# ============================================================
 
-def quality_check():
+def quality_check(
+    output_file,
+    sample_count,
+    duration
+):
 
-    print("\n================================")
-    print("DATA QUALITY CHECK")
-    print("================================")
+    print()
 
-    if not filepath.exists():
+    print(
+        "================================="
+    )
+
+    print(
+        "DATA QUALITY CHECK"
+    )
+
+    print(
+        "================================="
+    )
+
+
+    quality_status = "PASS"
+
+
+    # ========================================================
+    # SAMPLE COUNT
+    # ========================================================
+
+    if sample_count > 0:
 
         print(
-            "\nERROR: Recording file not found."
+            f"Sample count     : PASS ({sample_count})"
         )
+
+    else:
 
         print(
-            filepath
+            "Sample count     : FAIL (0)"
         )
 
-        return False
+        quality_status = "WARNING"
 
-    timestamps = []
 
-    channel_data = {
+    # ========================================================
+    # SAMPLING RATE
+    # ========================================================
+
+    if duration > 0:
+
+        sampling_rate = (
+            (sample_count - 1)
+            / duration
+        )
+
+    else:
+
+        sampling_rate = 0
+
+
+    if (
+        590 <= sampling_rate <= 610
+    ):
+
+        print(
+            f"Sampling rate    : PASS "
+            f"({sampling_rate:.2f} Hz)"
+        )
+
+    else:
+
+        print(
+            f"Sampling rate    : WARNING "
+            f"({sampling_rate:.2f} Hz)"
+        )
+
+        quality_status = "WARNING"
+
+
+    # ========================================================
+    # READ CSV
+    # ========================================================
+
+    missing_values = False
+
+
+    channel_values = {
+
         "CH1": [],
         "CH2": [],
         "CH3": [],
         "CH4": []
     }
 
-    missing_values = False
 
     with open(
-        filepath,
+        output_file,
         "r",
         newline=""
     ) as file:
 
-        reader = csv.DictReader(file)
+        reader = csv.DictReader(
+            file
+        )
+
 
         for row in reader:
 
-            try:
+            for channel in channel_values:
 
-                timestamp = int(
-                    row["timestamp_us"]
-                )
+                value = row[channel]
 
-                timestamps.append(
-                    timestamp
-                )
 
-                for channel in channel_data:
+                if value == "":
 
-                    value = row[channel]
+                    missing_values = True
 
-                    if value == "":
+                else:
 
-                        missing_values = True
+                    channel_values[channel].append(
+                        int(value)
+                    )
 
-                    else:
 
-                        channel_data[channel].append(
-                            int(value)
-                        )
-
-            except (
-                ValueError,
-                KeyError,
-                TypeError
-            ):
-
-                missing_values = True
-
-    # ======================================
-    # SAMPLE COUNT
-    # ======================================
-
-    sample_count = len(timestamps)
-
-    print(
-        f"Sample count     : {sample_count}"
-    )
-
-    # ======================================
-    # SAMPLING RATE
-    # ======================================
-
-    recording_duration = 0
-
-    sampling_rate = 0
-
-    if len(timestamps) > 1:
-
-        recording_duration = (
-            timestamps[-1]
-            - timestamps[0]
-        ) / 1_000_000
-
-        if recording_duration > 0:
-
-            sampling_rate = (
-                (len(timestamps) - 1)
-                / recording_duration
-            )
-
-    sampling_rate_ok = (
-        590
-        <= sampling_rate
-        <= 610
-    )
-
-    print(
-        f"Sampling rate    : "
-        f"{'PASS' if sampling_rate_ok else 'WARNING'} "
-        f"({sampling_rate:.2f} Hz)"
-    )
-
-    # ======================================
+    # ========================================================
     # MISSING VALUES
-    # ======================================
+    # ========================================================
 
-    print(
-        f"Missing values   : "
-        f"{'WARNING' if missing_values else 'PASS'}"
-    )
+    if not missing_values:
 
-    # ======================================
+        print(
+            "Missing values   : PASS"
+        )
+
+    else:
+
+        print(
+            "Missing values   : FAIL"
+        )
+
+        quality_status = "WARNING"
+
+
+    # ========================================================
     # CHANNEL CHECKS
-    # ======================================
+    # ========================================================
 
-    channel_status = {}
-
-    for channel, values in channel_data.items():
+    for channel, values in channel_values.items():
 
         if len(values) == 0:
 
-            channel_status[channel] = False
-
             print(
-                f"{channel:<17}: WARNING"
+                f"{channel:<17}: FAIL"
             )
 
+            quality_status = "WARNING"
+
             continue
+
 
         minimum = min(values)
 
         maximum = max(values)
 
-        constant = (
-            minimum == maximum
+
+        # ----------------------------------------------------
+        # Constant signal
+        # ----------------------------------------------------
+
+        if minimum == maximum:
+
+            print(
+                f"{channel:<17}: WARNING "
+                f"(constant: {minimum})"
+            )
+
+            quality_status = "WARNING"
+
+
+        # ----------------------------------------------------
+        # Full-range saturation
+        # ----------------------------------------------------
+
+        elif (
+            minimum <= 0
+            and maximum >= 4095
+        ):
+
+            print(
+                f"{channel:<17}: WARNING "
+                f"(possible saturation)"
+            )
+
+            quality_status = "WARNING"
+
+
+        else:
+
+            print(
+                f"{channel:<17}: PASS"
+            )
+
+
+    # ========================================================
+    # PACKET INTEGRITY
+    # ========================================================
+
+    print()
+
+    print(
+        f"BLE packets      : {received_packets}"
+    )
+
+    print(
+        f"Lost packets     : {lost_packets}"
+    )
+
+    print(
+        f"Bad packet sizes : {unexpected_packet_sizes}"
+    )
+
+
+    if lost_packets == 0:
+
+        print(
+            "Packet integrity : PASS"
         )
 
-        saturated = (
-            minimum <= 5
-            or maximum >= 4090
+    else:
+
+        print(
+            "Packet integrity : FAIL"
         )
 
-        channel_status[channel] = not (
-            constant
-            or saturated
+        quality_status = "WARNING"
+
+
+    if unexpected_packet_sizes == 0:
+
+        print(
+            "Packet size      : PASS"
+        )
+
+    else:
+
+        print(
+            "Packet size      : FAIL"
+        )
+
+        quality_status = "WARNING"
+
+
+    # ========================================================
+    # FINAL STATUS
+    # ========================================================
+
+    print(
+        "---------------------------------"
+    )
+
+
+    print(
+        f"Overall quality  : {quality_status}"
+    )
+
+
+    print(
+        "================================="
+    )
+
+
+    return (
+        quality_status,
+        sampling_rate
+    )
+
+
+# ============================================================
+# SAVE RECORDING
+# ============================================================
+
+def save_recording():
+
+    if len(samples) == 0:
+
+        print()
+
+        print(
+            "ERROR: No samples were recorded."
+        )
+
+        return
+
+
+    # ========================================================
+    # OUTPUT PATH
+    # ========================================================
+
+    output_file = (
+        create_output_path()
+    )
+
+
+    # ========================================================
+    # NEVER OVERWRITE
+    # ========================================================
+
+    if output_file.exists():
+
+        print()
+
+        print(
+            "ERROR: Recording already exists:"
         )
 
         print(
-            f"{channel:<17}: "
-            f"{'PASS' if channel_status[channel] else 'WARNING'}"
+            output_file
         )
 
-    # ======================================
-    # BLE PACKETS
-    # ======================================
+        print()
 
-    packet_status = (
-        state["invalid_packets"] == 0
+        print(
+            "Use a different trial number."
+        )
+
+        return
+
+
+    # ========================================================
+    # TIMESTAMP RANGE
+    # ========================================================
+
+    first_timestamp = (
+        samples[0][0]
     )
 
-    print(
-        f"BLE packets      : "
-        f"{'PASS' if packet_status else 'WARNING'} "
-        f"(invalid: {state['invalid_packets']})"
+    last_timestamp = (
+        samples[-1][0]
     )
 
-    # ======================================
-    # OVERALL
-    # ======================================
 
-    all_channels_ok = all(
-        channel_status.values()
+    duration = (
+        last_timestamp
+        - first_timestamp
+    ) / 1_000_000
+
+
+    # ========================================================
+    # SAVE CSV
+    # ========================================================
+
+    with open(
+        output_file,
+        "w",
+        newline=""
+    ) as file:
+
+        writer = csv.writer(
+            file
+        )
+
+
+        writer.writerow([
+            "timestamp_us",
+            "packet_sequence",
+            "CH1",
+            "CH2",
+            "CH3",
+            "CH4"
+        ])
+
+
+        writer.writerows(
+            samples
+        )
+
+
+    # ========================================================
+    # QUALITY CHECK
+    # ========================================================
+
+    (
+        quality_status,
+        sampling_rate
+    ) = quality_check(
+        output_file,
+        len(samples),
+        duration
     )
 
-    overall_quality = (
-        len(timestamps) > 0
-        and sampling_rate_ok
-        and not missing_values
-        and all_channels_ok
-        and packet_status
+
+    # ========================================================
+    # CREATE METADATA DIRECTORY
+    # ========================================================
+
+    RAW_ROOT.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    print("--------------------------------")
 
-    print(
-        f"Overall quality  : "
-        f"{'PASS' if overall_quality else 'WARNING'}"
-    )
-
-    print("================================")
-
-    # ======================================
-    # METADATA
-    # ======================================
+    # ========================================================
+    # METADATA FILE
+    # ========================================================
 
     metadata_exists = (
         METADATA_FILE.exists()
     )
+
 
     with open(
         METADATA_FILE,
@@ -907,7 +881,10 @@ def quality_check():
         newline=""
     ) as file:
 
-        writer = csv.writer(file)
+        writer = csv.writer(
+            file
+        )
+
 
         if not metadata_exists:
 
@@ -921,18 +898,28 @@ def quality_check():
                 "samples",
                 "duration_seconds",
                 "sampling_rate_hz",
+                "received_packets",
+                "lost_packets",
                 "quality_status",
                 "file_path"
             ])
 
+
         recording_id = (
-            f"{participant}_S{session}_"
-            f"{condition}_{word}_T{trial}"
+            f"{participant}"
+            f"_S{int(session):02d}"
+            f"_{condition}"
+            f"_{word}"
+            f"_T{int(trial):03d}"
         )
 
-        relative_filepath = filepath.relative_to(
-            PROJECT_ROOT
+
+        relative_path = (
+            output_file.relative_to(
+                PROJECT_ROOT
+            )
         )
+
 
         writer.writerow([
             recording_id,
@@ -941,87 +928,281 @@ def quality_check():
             condition,
             word,
             trial,
-            len(timestamps),
-            f"{recording_duration:.3f}",
+            len(samples),
+            f"{duration:.6f}",
             f"{sampling_rate:.2f}",
-            (
-                "PASS"
-                if overall_quality
-                else "WARNING"
-            ),
-            str(relative_filepath)
+            received_packets,
+            lost_packets,
+            quality_status,
+            str(relative_path)
         ])
 
-    # ======================================
-    # FINAL
-    # ======================================
 
-    print("\n================================")
-    print("Recording complete!")
-    print("================================")
+    # ========================================================
+    # FINAL RECORDING SUMMARY
+    # ========================================================
+
+    print()
 
     print(
-        f"Samples recorded : {len(timestamps)}"
+        "================================="
     )
 
     print(
-        f"Duration         : "
-        f"{recording_duration:.3f} s"
+        "RECORDING COMPLETE"
     )
 
     print(
-        f"Sampling rate    : "
-        f"{sampling_rate:.2f} Hz"
+        "================================="
+    )
+
+
+    print(
+        f"Samples recorded : {len(samples)}"
     )
 
     print(
-        f"Quality          : "
-        f"{'PASS' if overall_quality else 'WARNING'}"
+        f"Duration         : {duration:.3f} s"
     )
 
     print(
-        f"Data file        : {filepath}"
+        f"Sampling rate    : {sampling_rate:.2f} Hz"
     )
 
     print(
-        f"Metadata         : {METADATA_FILE}"
+        f"BLE packets      : {received_packets}"
     )
 
-    return overall_quality
+    print(
+        f"Lost packets     : {lost_packets}"
+    )
+
+    print(
+        f"Quality           : {quality_status}"
+    )
+
+    print()
+
+    print(
+        "Saved to:"
+    )
+
+    print(
+        output_file
+    )
+
+    print()
 
 
-# ==========================================
+# ============================================================
 # MAIN
-# ==========================================
+# ============================================================
 
-async def main():
+async def run():
 
-    recording_success = await record_ble()
+    global participant
+    global session
+    global condition
+    global word
+    global trial
 
-    if not recording_success:
+    # ========================================================
+    # RESET STATE
+    # ========================================================
 
-        print(
-            "\nRecording failed. "
-            "Quality check was not run."
-        )
+    samples.clear()
+
+    recording_started.clear()
+
+    recording_stopped.clear()
+
+
+    # ========================================================
+    # RECORDING INFORMATION
+    # ========================================================
+
+    print()
+
+    print(
+        "================================="
+    )
+
+    print(
+        "IRIS BLE EMG DATA COLLECTION"
+    )
+
+    print(
+        "================================="
+    )
+
+    print()
+
+
+    participant = input(
+        "Participant ID: "
+    ).strip().upper()
+
+
+    session = input(
+        "Session number: "
+    ).strip()
+
+
+    condition = input(
+        "Condition "
+        "(SILENT/VOICED/WHISPERED/REST): "
+    ).strip().upper()
+
+
+    word = input(
+        "Word: "
+    ).strip().upper()
+
+
+    trial = input(
+        "Trial number: "
+    ).strip()
+
+
+    # ========================================================
+    # FIND DEVICE
+    # ========================================================
+
+    device = await find_device()
+
+
+    if device is None:
 
         return
 
-    quality_check()
 
+    # ========================================================
+    # CONNECT
+    # ========================================================
 
-# ==========================================
-# RUN
-# ==========================================
-
-try:
-
-    asyncio.run(main())
-
-except KeyboardInterrupt:
-
-    state["recording_enabled"] = False
+    print()
 
     print(
-        "\n\nRecording stopped by user."
+        "Connecting to IRIS-EMG..."
     )
+
+
+    async with BleakClient(
+        device
+    ) as client:
+
+        print(
+            "Connected!"
+        )
+
+
+        # ====================================================
+        # START BLE NOTIFICATIONS
+        # ====================================================
+
+        await client.start_notify(
+            CHARACTERISTIC_UUID,
+            notification_handler
+        )
+
+
+        # ====================================================
+        # READY
+        # ====================================================
+
+        print()
+
+        print(
+            "================================="
+        )
+
+        print(
+            "READY TO RECORD"
+        )
+
+        print(
+            "================================="
+        )
+
+        print()
+
+        print(
+            "HOLD ENTER to record."
+        )
+
+        print(
+            "RELEASE ENTER to stop."
+        )
+
+        print()
+
+
+        # ====================================================
+        # KEYBOARD LISTENER
+        # ====================================================
+
+        listener = keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release
+        )
+
+
+        listener.start()
+
+
+        # ====================================================
+        # WAIT FOR RECORDING START
+        # ====================================================
+
+        await asyncio.to_thread(
+            recording_started.wait
+        )
+
+
+        # ====================================================
+        # WAIT FOR RECORDING STOP
+        # ====================================================
+
+        await asyncio.to_thread(
+            recording_stopped.wait
+        )
+
+
+        # ====================================================
+        # STOP BLE NOTIFICATIONS
+        # ====================================================
+
+        await client.stop_notify(
+            CHARACTERISTIC_UUID
+        )
+
+
+        listener.stop()
+
+
+        # ====================================================
+        # SAVE RECORDING
+        # ====================================================
+
+        save_recording()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(
+            run()
+        )
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print(
+            "Recording cancelled."
+        )
